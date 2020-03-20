@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>three.js webgl - FBX loader</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+    <link type="text/css" rel="stylesheet" href="main.css">
+</head>
+
+<body>
+<div id="info">球球大作战<br />按下 WASD键 进行移动,空格键加速<br />按住鼠标左键观察周围，右键移动人物及相机<br/>P键截图</div>
+<script src="js/libs/ammo.js"></script>
+
+<script type="module">
+
+    import * as THREE from '../build/three.module.js';
+
+    import Stats from './jsm/libs/stats.module.js';
+
+    import { OrbitControls } from './jsm/controls/OrbitControls.js';
+    import { GLTFLoader } from './jsm/loaders/GLTFLoader.js';
+    import { Reflector } from './jsm/objects/Reflector.js';
+
+    var container, stats, controls;
+    var camera, scene, renderer, light;
+
+    var model, skeleton, mixer,man;
+
+    var idleAction, walkAction, runAction;//三个动作状态，分别表示原地、走路、跑步
+    var idleWeight, walkWeight, runWeight; //三个动作的权重，默认为（10 0.01）代表原地停留
+                                           //（0，1，0）代表走路，（0，0，1）代表跑步
+    var actions, step; //分别为模型的动作（数组）、前进的步长（控制移动速度）
+    var clock = new THREE.Clock();
+
+    var moveForward = false; //四种移动的状态
+    var moveBackward = false;
+    var turnLeft = false;
+    var turnRight = false;
+    var quickMove = false;
+
+    var raycaster = new THREE.Raycaster();
+    // Physics variables
+    var gravityConstant = 9.8;//物理世界加速度
+    var collisionConfiguration;
+    var dispatcher;
+    var broadphase;
+    var solver;
+    var physicsWorld;//物理世界
+    var margin = 0.05;//物理世界边界容错
+
+    var groundlong = 60;
+    var groundwidth = 40;
+
+    // Rigid bodies include all movable objects
+    var rigidBodies = [];
+
+    var pos = new THREE.Vector3();
+    var quat = new THREE.Quaternion();
+    var transformAux1;
+    var tempBtVec3_1;
+
+    var objectsToRemove = [];
+    for ( var i = 0; i < 500; i ++ ) {
+
+        objectsToRemove[ i ] = null;
+
+    }
+    var numObjectsToRemove = 0;
+
+    var impactPoint = new THREE.Vector3();
+    var impactNormal = new THREE.Vector3();
+
+    var textureLoader = new THREE.TextureLoader();
+
+    // - Main code -
+
+    Ammo().then( function ( AmmoLib ) {
+
+        Ammo = AmmoLib;
+
+        init();
+        animate();
+
+    } );
+
+    function init() {
+
+        container = document.createElement( 'div' );
+        document.body.appendChild( container );
+
+        // scene
+        scene = new THREE.Scene();
+        //CubeTexture背景贴图
+        var cubeLoader = new THREE.CubeTextureLoader();
+        cubeLoader.setPath( 'textures/cube/skyboxsun25deg/' );
+
+        scene.background = cubeLoader.load( [
+            'px.jpg', 'nx.jpg',
+            'py.jpg', 'ny.jpg',
+            'pz.jpg', 'nz.jpg'
+        ] );
+
+        clock = new THREE.Clock();
+        //摄像机建立
+        camera = new THREE.PerspectiveCamera( 30, window.innerWidth / window.innerHeight, 1, 10000 );
+        camera.position.set( 0, 6, 12 );
+        camera.lookAt( 0, 1, 0 );
+
+        //各个光源的建立
+        scene.add( new THREE.AmbientLight( 0x666666 ) );
+
+        var hemiLight = new THREE.HemisphereLight( 0xffffff, 0x444444 );
+        hemiLight.position.set( 0, 20, 0 );
+        scene.add( hemiLight );
+
+        var dirLight = new THREE.DirectionalLight( 0xffffff );
+        dirLight.position.set( - 100, 100, - 100 );
+        dirLight.castShadow = true;
+
+        scene.add( dirLight );
+
+        //渲染器加载
+        renderer = new THREE.WebGLRenderer( { antialias: true } );
+        renderer.setPixelRatio( window.devicePixelRatio );
+        renderer.setSize( window.innerWidth, window.innerHeight );
+        renderer.shadowMap.enabled = true;
+        container.appendChild( renderer.domElement );
+
+        controls = new OrbitControls( camera, renderer.domElement );
+        controls.update();
+
+        window.addEventListener( 'resize', onWindowResize, false );
+
+        //监视器加载
+        stats = new Stats();
+        container.appendChild( stats.dom );
+
+        //物理引擎环境建立
+        initPhysics();
+
+        //视图模型以及物理模型的建立
+        //地面模型加载
+        pos.set( 0, - 0.5, 0 );
+        quat.set( 0, 0, 0, 1 );
+        var material1 = new THREE.MeshStandardMaterial( {
+            roughness: 0.7,
+            color: 0xffffff,
+            bumpScale: 0.002,
+            metalness: 0.2
+        } );
+
+        textureLoader.load( "textures/brick_diffuse.jpg", function ( map ) {
+            map.wrapS = THREE.RepeatWrapping;
+            map.wrapT = THREE.RepeatWrapping;
+            map.anisotropy = 4;
+            map.repeat.set( 19.5, 1.5 );
+            material1.map = map;
+            material1.needsUpdate = true;
+        } );
+        textureLoader.load( "textures/brick_bump.jpg", function ( map ) {
+            map.wrapS = THREE.RepeatWrapping;
+            map.wrapT = THREE.RepeatWrapping;
+            map.anisotropy = 4;
+            map.repeat.set( 19.5, 1.5 );
+            material1.bumpMap = map;
+            material1.needsUpdate = true;
+        } );
+
+        var ground = createParalellepipedWithPhysics( groundlong, 1, groundwidth, 0, pos, quat, new THREE.MeshPhongMaterial( { color: 0x666666 } ) );
+        ground.receiveShadow = true;
+        textureLoader = new THREE.TextureLoader();
+        textureLoader.load( "textures/grid.png", function ( texture ) {
+            texture.wrapS = THREE.RepeatWrapping;
+            texture.wrapT = THREE.RepeatWrapping;
+            texture.repeat.set( 40, 40 );
+            ground.material.map = texture;
+            ground.material.needsUpdate = true;
+        } );
+
+        var geometry0 = new THREE.PlaneBufferGeometry(30,40);
+
+        //地面的镜面建立
+        var groundMirror = new Reflector( geometry0, {
+            clipBias: 0.003,
+            textureWidth: window.innerWidth * window.devicePixelRatio,
+            textureHeight: window.innerHeight * window.devicePixelRatio,
+            color: 0x777777,
+            recursion: 1
+        } );
+        groundMirror.position.y = 0.001;
+        groundMirror.position.x = 15;
+        groundMirror.rotateX( - Math.PI / 2 );
+        scene.add( groundMirror );
+
+        //模型建立
+        var loader = new GLTFLoader();
+        loader.load( 'models/gltf/Soldier.glb', function ( gltf ) {
+
+            model = gltf.scene;
+            model.position.set(0,0,0);
+            model.traverse(function ( child ) {
+
+                child.castShadow = true;
+
+            } );
+            scene.add( model );
+            dirLight.target=model; //平行光跟随人物模型移动，以保证阴影不会消失
+
+            var animations = gltf.animations; //读取模型的动画骨骼
+
+            mixer = new THREE.AnimationMixer( model ); //动画混合器
+
+            idleAction = mixer.clipAction( animations[ 0 ] ); //返回传递的剪辑的动画混合器
+            walkAction = mixer.clipAction( animations[ 3 ] );
+            runAction = mixer.clipAction( animations[ 1 ] );
+
+            actions = [ idleAction, walkAction, runAction ];
+
+            activateAllActions(); //让所有动作都动起来
+            animate();
+        });
+
+        //墙面模型的建立
+        var wallheight = 3;
+        //Wall1
+        pos.set( 0, wallheight/2, (groundwidth-1)/2 );
+        quat.set( 0, 0, 0, 1 );
+        var wall1 = createParalellepipedWithPhysics( groundlong, wallheight, 1, 0, pos, quat, material1 );
+        wall1.receiveShadow = true;
+
+        //Wall2
+        pos.set( 0, wallheight/2, -(groundwidth-1)/2 );
+        quat.set( 0, 0, 0, 1 );
+        var wall2 = createParalellepipedWithPhysics( groundlong, wallheight, 1, 0, pos, quat, material1 );
+        wall2.receiveShadow = true;
+
+        //Wall3
+        pos.set( (groundlong-1)/2, wallheight/2, 0 );
+        quat.set( 0, 0, 0, 1 );
+        var wall3 = createParalellepipedWithPhysics( 1, wallheight, groundwidth, 0, pos, quat, material1 );
+        wall3.receiveShadow = true;
+
+        //球体模型的建立
+        for(var i=0;i<=20;i++){
+            var ballMass = 0.02;
+            var ballRadius = 0.4;
+            var ballMaterial = new THREE.MeshPhongMaterial( { color: 0x666666 } );
+            var ball = new THREE.Mesh( new THREE.SphereBufferGeometry( ballRadius, 20, 20 ), ballMaterial );
+            ball.castShadow = true;
+            ball.receiveShadow = true;
+            var ballShape = new Ammo.btSphereShape( ballRadius );
+            ballShape.setMargin( margin );
+            pos.set(  (Math.random()-0.5)*(groundlong-2), (Math.random())*100, (Math.random()-0.5)*(groundwidth-2) );
+            quat.set( 0, 0, 0, 1 );
+            createRigidBody( ball, ballShape, ballMass, pos, quat );
+            ball.userData.physicsBody.setFriction( 0.5 );
+        }
+
+        //人物模型的物理模型的建立
+        var manMass = 0;
+        man = new THREE.Mesh( new THREE.CylinderGeometry(0.5, 0.5 ,2 ,40 ,40), new THREE.MeshPhongMaterial( { color: 0x202020 } ) );
+        man.visible=false;
+        pos.set( 0, 1, 0 );
+        quat.set( 0, 0, 0, 1);
+        man.castShadow = true;
+        man.receiveShadow = true;
+        var manShape = new Ammo.btSphereShape( 0.5 );
+        manShape.setMargin( margin);
+        createRigidBody( man, manShape, manMass, pos, quat );
+        man.userData.physicsBody.setFriction( 0.2 );
+
+
+        ///动作控制
+        //启用所有动作
+        function activateAllActions() {
+
+            setWeight( idleAction, 1 ); //初始化三种动作的权重
+            setWeight( walkAction, 0 );
+            setWeight( runAction, 0.01  );
+
+            actions.forEach( function ( action ) {
+
+                action.play(); //播放动画
+
+            } );
+
+        }
+
+        //改变动作的权重
+        function setWeight( action, weight ) {
+           // 这个函数是必需的，因为animationAction.crossFadeTo（）默认禁用了它的开始操作和设置
+            action.enabled = true;
+            //开始动作的时间刻度为（（开始动画的持续时间）/（结束动画的持续时间））
+            action.setEffectiveTimeScale( 1 );
+            action.setEffectiveWeight( weight );
+
+        }
+
+        //动作转换判断函数，包含三个参数（开始的动作，结束的动作，中间经过的时长）
+        function prepareCrossFade( startAction, endAction, defaultDuration ) {
+
+            // 确保所有动作都不停止
+            unPauseAllActions();
+
+            // 如果当前操作为“空闲”（持续4秒），则立即执行动作转换；
+            //否则，等待当前操作完成其当前循环
+            if ( startAction === idleAction ) {
+                executeCrossFade( startAction, endAction, defaultDuration );
+            } else {
+                synchronizeCrossFade( startAction, endAction, defaultDuration );
+            }
+        }
+
+        //不停止所有动作
+        function unPauseAllActions() {
+            actions.forEach( function ( action ) {
+                action.paused = false;
+            } );
+        }
+
+        //动作淡入淡出
+        function executeCrossFade( startAction, endAction, duration ) {
+            // 不仅开始动作，而且结束动作在衰减前必须获得1的权重
+            //（关于开始动作，这里已经保证了它的逻辑正确）
+            setWeight( endAction, 1 );
+            endAction.time = 0;
+
+            // 淡入操作来开启动作，也可以通过将第三个参数设置为false来尝试不进行变形
+            startAction.crossFadeTo( endAction, duration, true );
+        }
+
+        //动作转换
+        function synchronizeCrossFade( startAction, endAction, duration ) {
+            //在当前动作结束后，将新的动作转换加入队列
+            mixer.addEventListener( 'loop', onLoopFinished );
+
+            function onLoopFinished( event ) {
+                if ( event.action === startAction ) {
+                    //移除先前的动作，加入新的动作并执行动作淡入淡出操作
+                    mixer.removeEventListener( 'loop', onLoopFinished );
+                    executeCrossFade( startAction, endAction, duration );
+                }
+            }
+        }
+
+        //鼠标按下的事件
+        var onKeyDown = function ( event ) {
+
+            switch ( event.keyCode ) {
+
+                case 87: // w
+                    if(moveForward===false){ //只执行一次赋值以及动作播放
+                        moveForward = true;
+                        //将作动从原地转换为走路状态，中间的事件由当前的走路权重决定，以防止快速连续按键下的动作抽搐
+                        prepareCrossFade( idleAction, walkAction, 1.0-walkWeight );
+                    }
+                    break;
+
+                case 65: // a
+                    if(!turnLeft){
+                        turnLeft = true;
+                        if(!moveForward)prepareCrossFade( idleAction, walkAction, 0.2*(1.0-walkWeight));
+                    }
+
+                    break;
+
+                case 83: // s
+                    if(moveBackward===false){
+                        moveBackward = true;
+                        prepareCrossFade( idleAction, walkAction, 1.0-walkWeight );
+                    }
+                    break;
+
+                case 68: // d
+                    if(turnRight===false){
+                        turnRight = true;
+                        if(!moveForward)prepareCrossFade( idleAction, walkAction, 0.2*(1.0-walkWeight));
+                    }
+                    break;
+
+                case 32: //quickMove
+                    //space
+                    //在按了前进键的同时，按冲刺键才是有效的
+                    if(walkWeight && quickMove ===false){
+                        quickMove = true;
+                        prepareCrossFade( walkAction, runAction, 1.0-runWeight );
+                    }
+                    break;
+            }
+
+        };
+
+        //鼠标松开事件
+        var onKeyUp = function ( event ) {
+
+            switch ( event.keyCode ) {
+
+                case 87: // w
+                    moveForward = false;
+                    if(quickMove){
+                        prepareCrossFade( runAction, walkAction, 0.8*walkWeight);
+                        prepareCrossFade( walkAction, idleAction, 0.8*walkWeight );
+
+                    }
+                    else prepareCrossFade( walkAction, idleAction, 0.8*walkWeight );
+                    break;
+
+                case 65: // a
+                    turnLeft = false;
+                    if(!moveForward)prepareCrossFade( walkAction, idleAction, 0.2 );
+                    break;
+
+                case 83: // s
+                    moveBackward = false;
+                    //为防止后退与前进动画的冲突，在此直接设置权重，让人物快速停下来。
+                    //移动控制中认为只要walkAction这一变量值不为零，就继续向前移动，以匹配动画效果
+                    setWeight(idleAction,1);
+                    setWeight(walkAction,0);
+                    break;
+
+                case 68: // d
+                    turnRight = false;
+                    if(!moveForward)prepareCrossFade( walkAction, idleAction, 0.2*walkWeight );
+                    break;
+
+                case 32: //quickMove
+                    //space
+                    quickMove = false;
+                    prepareCrossFade( runAction, walkAction, 0.8*runWeight );
+                    break;
+
+                case 80:
+                    renderer.render(scene, camera);
+                    let imgData = renderer.domElement.toDataURL("image/jpeg");//这里可以选择png格式jpeg格式
+                    debugBase64(imgData);
+                    break;
+            }
+
+        };
+
+        //将鼠标响应事件加入事件列表
+        document.addEventListener( 'keydown', onKeyDown, false );
+        document.addEventListener( 'keyup', onKeyUp, false );
+    }
+
+    function initPhysics() {
+
+        // Physics configuration
+
+        collisionConfiguration = new Ammo.btDefaultCollisionConfiguration();
+        dispatcher = new Ammo.btCollisionDispatcher( collisionConfiguration );
+        broadphase = new Ammo.btDbvtBroadphase();
+        solver = new Ammo.btSequentialImpulseConstraintSolver();
+        physicsWorld = new Ammo.btDiscreteDynamicsWorld( dispatcher, broadphase, solver, collisionConfiguration );//建立物理世界
+        physicsWorld.setGravity( new Ammo.btVector3( 0, - gravityConstant, 0 ) );//物理世界加载加速度
+
+        transformAux1 = new Ammo.btTransform();
+        tempBtVec3_1 = new Ammo.btVector3( 0, 0, 0 );
+
+    }
+    //建立长方体的物理模型以及关联显示模型
+    function createParalellepipedWithPhysics( sx, sy, sz, mass, pos, quat, material ) {
+
+        var object = new THREE.Mesh( new THREE.BoxBufferGeometry( sx, sy, sz, 1, 1, 1 ), material );
+        var shape = new Ammo.btBoxShape( new Ammo.btVector3( sx * 0.5, sy * 0.5, sz * 0.5 ) );
+        shape.setMargin( margin );
+
+        createRigidBody( object, shape, mass, pos, quat );
+
+        return object;
+
+    }
+    //移动碰撞后的刚性模型
+    function removeDebris( object ) {
+
+        scene.remove( object );
+
+        physicsWorld.removeRigidBody( object.userData.physicsBody );
+
+    }
+
+	//建立物理刚性模型以及将物理模型和显示模型相关联
+	function createRigidBody( object, physicsShape, mass, pos, quat ) {
+		//检验确认位置和方向信息
+        if ( pos ) {
+            object.position.copy( pos );
+        } else {
+            pos = object.position;
+        }
+        if ( quat ) {
+            object.quaternion.copy( quat );
+        } else {
+            quat = object.quaternion;
+        }
+
+		//将位置和方向信息加入transform变量，生成物体在物理世界的位置方向的运动状态
+        var transform = new Ammo.btTransform();
+        transform.setIdentity();
+        transform.setOrigin( new Ammo.btVector3( pos.x, pos.y, pos.z ) );
+        transform.setRotation( new Ammo.btQuaternion( quat.x, quat.y, quat.z, quat.w ) );
+        var motionState = new Ammo.btDefaultMotionState( transform );
+
+		//对物体的形状和质量进行关联
+		var localInertia = new Ammo.btVector3( 0, 0, 0 );
+		physicsShape.calculateLocalInertia( mass, localInertia );
+
+		//对转换过的运动状态参数和物体本身的参数进行结合，并生成变量body
+		var rbInfo = new Ammo.btRigidBodyConstructionInfo( mass, motionState, physicsShape, localInertia );
+		var body = new Ammo.btRigidBody( rbInfo );
+
+        body.setFriction( 0.0 );
+
+        object.userData.physicsBody = body;
+        object.userData.collided = false;
+
+		//在显示世界总加载显示模型object
+		scene.add( object );
+
+		//设置物理模型的状态
+		if ( mass > 0 ) {
+			rigidBodies.push( object );
+
+			// Disable deactivation
+			body.setActivationState( 4 );
+		}
+
+		//在物理空间加载物理模型
+		physicsWorld.addRigidBody( body );
+
+		return body;
+
+    }
+
+    function updatePhysics( deltaTime ) {
+
+        // Step world
+        physicsWorld.stepSimulation( deltaTime, 10 );
+
+        //更新圆柱模型（人物的物理世界替代品）
+        var softBody = man.userData.physicsBody; //获取圆柱实体的物理世界身体
+        var ns=softBody.getMotionState(); //获取物理身体的坐标
+        ns.getWorldTransform( transformAux1 );
+
+        //修改提取出来的坐标变量的位置属性为人物模型的位置
+        transformAux1.setOrigin( new Ammo.btVector3( model.position.x, model.position.y, model.position.z ) );
+        //导入坐标变量，更新物理身体的信息
+        ns.setWorldTransform(transformAux1);
+        softBody.setMotionState(ns);
+
+        //更新刚性模型，使其与可见模型的位置属性相匹配
+        for ( var i = 0, il = rigidBodies.length; i < il; i ++ ) {
+
+            var objThree = rigidBodies[ i ];
+            var objPhys = objThree.userData.physicsBody;
+            var ms = objPhys.getMotionState();
+
+            if ( ms ) {
+
+                ms.getWorldTransform( transformAux1 );
+                var p = transformAux1.getOrigin();
+                var q = transformAux1.getRotation();
+                objThree.position.set( p.x(), p.y(), p.z() );
+                objThree.quaternion.set( q.x(), q.y(), q.z(), q.w() );
+
+                objThree.userData.collided = false;
+
+            }
+
+        }
+
+        for ( var i = 0, il = dispatcher.getNumManifolds(); i < il; i ++ ) {
+            //通过检验所遍历的物理模型的状态来确认需不需要对该物理模型进行碰撞改变
+            var contactManifold = dispatcher.getManifoldByIndexInternal( i );
+            var rb0 = Ammo.castObject( contactManifold.getBody0(), Ammo.btRigidBody );
+            var rb1 = Ammo.castObject( contactManifold.getBody1(), Ammo.btRigidBody );
+
+            var threeObject0 = Ammo.castObject( rb0.getUserPointer(), Ammo.btVector3 ).threeObject;
+            var threeObject1 = Ammo.castObject( rb1.getUserPointer(), Ammo.btVector3 ).threeObject;
+
+            if ( ! threeObject0 && ! threeObject1 ) {
+
+                continue;
+
+            }
+
+            var userData0 = threeObject0 ? threeObject0.userData : null;
+            var userData1 = threeObject1 ? threeObject1.userData : null;
+
+            var collided0 = userData0 ? userData0.collided : false;
+            var collided1 = userData1 ? userData1.collided : false;
+
+            if (  collided0 && collided1 ) {
+
+                continue;
+
+            }
+
+			//若通过检测则进行碰撞变化
+            var contact = false;
+            var maxImpulse = 0;
+            for ( var j = 0, jl = contactManifold.getNumContacts(); j < jl; j ++ ) {
+
+                var contactPoint = contactManifold.getContactPoint( j );
+
+                if ( contactPoint.getDistance() < 0 ) {
+
+                    contact = true;
+                    var impulse = contactPoint.getAppliedImpulse();
+
+                    if ( impulse > maxImpulse ) {
+
+                        maxImpulse = impulse;
+                        var pos = contactPoint.get_m_positionWorldOnB();
+                        var normal = contactPoint.get_m_normalWorldOnB();
+                        impactPoint.set( pos.x(), pos.y(), pos.z() );
+                        impactNormal.set( normal.x(), normal.y(), normal.z() );
+
+                    }
+                    break;
+                }
+            }
+        }
+
+		//对碰撞后的模型进行改变
+        for ( var i = 0; i < numObjectsToRemove; i ++ ) {
+
+            removeDebris( objectsToRemove[ i ] );
+
+        }
+        numObjectsToRemove = 0;
+
+    }
+
+    //对鼠标拖动的摄像头响应
+    function onWindowResize() {
+
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+
+        renderer.setSize( window.innerWidth, window.innerHeight );
+
+    }
+
+    //动画变化加载
+    function animate() {
+
+        requestAnimationFrame( animate );
+
+        //实时获取三种运动状态的权重值
+        idleWeight = idleAction.getEffectiveWeight();
+        walkWeight = walkAction.getEffectiveWeight();
+        runWeight = runAction.getEffectiveWeight();
+
+        //最小时间单位
+        var delta = clock.getDelta();
+
+        //步长与运动状态权重相结合，以确保动画不停止，人物移动也不停止
+        step=0.02*(walkWeight+runWeight*3);
+
+        //如果按住W或者走路或奔跑的动作还没有停止，并且没有按S就让人物模型往前移动
+        if ((moveForward||walkWeight!==0||runWeight!==0)&&!moveBackward) {
+            //边界检测，检测下一步会不会越界，如果越界就不往前走
+            if(Math.abs(model.position.z - step * Math.cos(model.rotation.y))<=(groundwidth-3)/2){
+                model.position.z -= step * Math.cos(model.rotation.y);
+                camera.position.z -= step * Math.cos(model.rotation.y);
+            }
+
+            //边界检测，同上
+            if(Math.abs(model.position.x - step * Math.cos(model.rotation.y))<=(groundlong-3)/2){
+                model.position.x -=  step * Math.sin(model.rotation.y);
+                camera.position.x -= step * Math.sin(model.rotation.y);
+            }
+        }
+
+        //如果进行转向，改变模型的朝向，即按Y轴旋转模型
+        if (turnLeft||turnRight) {
+            model.rotation.y += (turnLeft-turnRight)*0.01;
+            camera.position.z = 12 * Math.cos(model.rotation.y) + model.position.z;
+            camera.position.x = 12 * Math.sin(model.rotation.y) + model.position.x;
+            camera.lookAt(model.position);
+        }
+
+        //只有按住S才能触发往后走的操作，区别于往前走，以保证动画的连续不卡顿
+        if(moveBackward){
+            //边界检测
+            if(Math.abs(model.position.z + step * Math.cos(model.rotation.y))<=(groundwidth-3)/2){
+                model.position.z += step * Math.cos(model.rotation.y);
+                camera.position.z += step * Math.cos(model.rotation.y);
+            }
+
+            if(Math.abs(model.position.x + step * Math.cos(model.rotation.y))<=(groundlong-3)/2){
+                model.position.x +=  step * Math.sin(model.rotation.y);
+                camera.position.x += step * Math.sin(model.rotation.y);
+            }
+        }
+
+        //更新动画
+        if ( mixer ) mixer.update( delta );
+
+        //更新物理世界
+        updatePhysics( delta );
+
+        renderer.render( scene, camera );
+
+        //将相机控制控件的目标绑定在人物模型身上，确保控件的中心点随人物的移动而改变
+        controls.target=model.position;
+        controls.update();
+
+        //更新帧数信息
+        stats.update();
+    }
+
+    //把图片保存为64位，并新建网页进行保存
+    function debugBase64(base64URL){
+        let win = window.open();
+        win.document.write('<image id="IframeReportImg" src="' + base64URL  + '" frameborder="0" style="border:0; top:0px; left:0px; bottom:0px; right:0px; width:100%; height:100%;" allowfullscreen ></image>');
+    }
+</script>
+
+</body>
+</html>
