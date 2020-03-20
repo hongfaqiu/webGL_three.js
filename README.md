@@ -1,2 +1,2 @@
 # webGL_three.js
- 球球大作战
+运用webgl开源库three.js开发的一个网页3D demo
